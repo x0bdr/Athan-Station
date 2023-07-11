@@ -1,0 +1,486 @@
+//wifi liberary
+#include <WiFi.h>
+
+//Time liberary
+#include "time.h"
+#include <ctime>
+
+//Wifi Manager liberary to enable wifi headless by AP mode and splash page config
+#include <WiFiManager.h>
+//HTTP Client liberary for GET and PUSH API to the web
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// Firebase ESP Client library to connect with Firebase real time database
+#include <Firebase_ESP_Client.h>
+
+//Provide the token generation process info.
+#include "addons/TokenHelper.h"
+
+//Provide the RTDB payload printing info and other helper functions.
+#include "addons/RTDBHelper.h"
+
+// Play MP3 from URL liberary
+#include "AudioTools.h"
+#include "AudioCodecs/CodecMP3Helix.h"
+#include "AudioLibs/AudioKit.h"
+
+#define TRIGGER_PIN 0
+
+// AthanStation-Bilal Firebase project API Key
+#define API_KEY "AIzaSyDyk-yoBVkKJ_fZPCmg-BufyI-IFgoJbpw"
+
+// AthanStation-Bilal RTDB URL
+#define DATABASE_URL "https://athanstation-bilal-default-rtdb.firebaseio.com/"
+
+
+// WifiManager Variables
+WiFiManager wm;                     // global wm instance
+WiFiManagerParameter custom_field;  // global param ( for non blocking w params )
+
+//Define Firebase Data object
+FirebaseData fbdo;
+
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+// Time virable to get the real time from the internet
+const long gmtOffset_sec = -14400;
+const int daylightOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+String DateTime;
+String DDMMYYYY;
+
+// Coordinates and salat calculation method Variables
+float latitude;
+float longitude;
+int method;
+
+// wifimanager can run in a blocking mode or a non blocking mode
+// Be sure to know how to process loops with no delay() if using non blocking
+bool wm_nonblocking = false;  // change to true to use non blocking
+
+unsigned long sendDataPrevMillis = 0;
+  // athan stream objects and Varibles
+String W;
+String P;
+const char *urls[] = {"https://athanstationmain.a0inve.com/local/Athan2.mp3"};
+const char *wifi;
+const char *password;
+AudioKitStream kit;
+MP3DecoderHelix decoder;
+ICYStream urlStream(wifi, password);
+AudioSourceURL source(urlStream, urls, "audio/mp3");
+AudioPlayer player(source, kit, decoder);
+
+  // Athan sound volume Variables
+int Fajer_Vol;
+int Dhur_Vol;
+int Asr_Vol;
+int Magrib_Vol;
+int Isha_Vol;
+char currentTime[6];
+
+
+void setup() {
+
+  Serial.begin(115200);
+  AudioLogger::instance().begin(Serial, AudioLogger::Info);
+  Serial.setDebugOutput(true);
+  delay(3000);
+  Serial.println(F("\n Starting"));
+
+  // setup output
+  auto cfg = kit.defaultConfig(TX_MODE);
+  cfg.sd_active = false;
+  kit.begin(cfg);
+
+  // setup player
+  player.setVolume(0.7);
+  player.begin();
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  getathantime();
+  startwififun();
+  W = WiFi.SSID();
+  P = WiFi.psk();
+  wifi = W.c_str();
+  password = P.c_str();
+  firebasefun();
+  printLocalTime();
+}
+
+void loop() {
+  delay(10000);
+  printLocalTime();
+  if (wm_nonblocking) wm.process();  // avoid delays() in loop when non-blocking and other long running code
+  checkButton();
+  firebasecall();
+  getathantime();
+}
+
+void startwififun() {
+  WiFi.mode(WIFI_STA); 
+  pinMode(TRIGGER_PIN, INPUT);
+
+
+  if (wm_nonblocking) wm.setConfigPortalBlocking(false);
+
+  int customFieldLength = 40;
+
+  const char* custom_radio_str = "<br/><label for='customfieldid'>Custom Field Label</label><input type='radio' name='customfieldid' value='1' checked> One<br><input type='radio' name='customfieldid' value='2'> Two<br><input type='radio' name='customfieldid' value='3'> Three";
+  new (&custom_field) WiFiManagerParameter(custom_radio_str);  // custom html input
+
+  wm.addParameter(&custom_field);
+  wm.setSaveParamsCallback(saveParamCallback);
+  std::vector<const char*> menu = { "wifi", "info", "param", "sep", "restart", "exit" };
+  wm.setMenu(menu);
+
+  wm.setClass("invert");
+  wm.setConfigPortalTimeout(30); 
+  bool res;
+  res = wm.autoConnect("AthanStation", "");
+  if (!res) {
+    Serial.println(F("Failed to connect or hit timeout"));
+    // ESP.restart();
+  } else {
+    //if you get here you have connected to the WiFi
+    Serial.println(F("connected.. :)"));
+  }
+}
+
+void firebasefun() {
+
+  /* Assign the api key (required) */
+  config.api_key = API_KEY;
+
+  /* Assign the RTDB URL (required) */
+  config.database_url = DATABASE_URL;
+
+  /* Sign up */
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println(F("ok"));
+    signupOK = true;
+  } else {
+    Serial.printf("%s\n", config.signer.signupError.message.c_str());
+  }
+
+  /* Assign the callback function for the long running token generation task */
+  config.token_status_callback = tokenStatusCallback;  //see addons/TokenHelper.h
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void firebasecall() {
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 15000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+    // Write Live word on the database path test/String
+    if (Firebase.RTDB.setString(&fbdo, "test/last_time_connected", DateTime)) {
+      Serial.println(F("PASSED"));
+      Serial.println("PATH: " + fbdo.dataPath());
+      Serial.println("TYPE: " + fbdo.dataType());
+    } else {
+      Serial.println(F("FAILED"));
+      Serial.println("REASON: " + fbdo.errorReason());
+    }
+    if (Firebase.RTDB.getInt(&fbdo, "/test/Fajer_Vol")) {
+      if (fbdo.dataType() == "int") {
+        Fajer_Vol = fbdo.intData();
+      }
+    } else {
+      Serial.println(fbdo.errorReason());
+    }
+    if (Firebase.RTDB.getInt(&fbdo, "/test/Dhur_Vol")) {
+      if (fbdo.dataType() == "int") {
+        Dhur_Vol = fbdo.intData();
+      }
+    } else {
+      Serial.println(fbdo.errorReason());
+    }
+    if (Firebase.RTDB.getInt(&fbdo, "/test/Asr_Vol")) {
+      if (fbdo.dataType() == "int") {
+        Asr_Vol = fbdo.intData();
+      }
+    } else {
+      Serial.println(fbdo.errorReason());
+    }
+    if (Firebase.RTDB.getInt(&fbdo, "/test/Magrib_Vol")) {
+      if (fbdo.dataType() == "int") {
+        Magrib_Vol = fbdo.intData();
+      }
+    } else {
+      Serial.println(fbdo.errorReason());
+    }
+    if (Firebase.RTDB.getInt(&fbdo, "/test/Isha_Vol")) {
+      if (fbdo.dataType() == "int") {
+        Isha_Vol = fbdo.intData();
+      }
+    } else {
+      Serial.println(fbdo.errorReason());
+    }
+  }
+}
+
+void checkButton() {
+  // check for button press
+  if (digitalRead(TRIGGER_PIN) == LOW) {
+    // poor mans debounce/press-hold, code not ideal for production
+    delay(50);
+    if (digitalRead(TRIGGER_PIN) == LOW) {
+      Serial.println(F("Button Pressed"));
+      // still holding button for 3000 ms, reset settings, code not ideaa for production
+      delay(3000);  // reset delay hold
+      if (digitalRead(TRIGGER_PIN) == LOW) {
+        Serial.println(F("Button Held"));
+        Serial.println(F("Erasing Config, restarting"));
+        wm.resetSettings();
+        ESP.restart();
+      }
+
+      // start portal w delay
+      Serial.println(F("Starting config portal"));
+      wm.setConfigPortalTimeout(120);
+
+      if (!wm.startConfigPortal("AthanStation", "")) {
+        Serial.println(F("failed to connect or hit timeout"));
+        delay(3000);
+        // ESP.restart();
+      } else {
+        //if you get here you have connected to the WiFi
+        Serial.println(F("connected.. :"));
+      }
+    }
+  }
+}
+
+String getParam(String name) {
+  //read parameter from server, for customhmtl input
+  String value;
+  if (wm.server->hasArg(name)) {
+    value = wm.server->arg(name);
+  }
+  return value;
+}
+
+void saveParamCallback() {
+  Serial.println(F("[CALLBACK] saveParamCallback fired"));
+  Serial.println("PARAM customfieldid = " + getParam("customfieldid"));
+}
+
+void printLocalTime() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println(F("Failed to obtain time"));
+    return;
+  }
+
+  char str[32];
+  strftime(str, sizeof str, "%A, %B %d %Y %H:%M:%S", &timeinfo);
+  DateTime = String(str);
+  Serial.println(DateTime);
+
+  char apittime[32];
+  strftime(apittime, sizeof apittime, "%d-%m-%Y", &timeinfo);
+  DDMMYYYY = String(apittime);
+  Serial.println(DDMMYYYY);
+}
+void getathantime() {
+  // Make HTTP request
+  latitude = 43.411480;
+  longitude = -80.464310;
+  method = 2;
+  HTTPClient http;
+  String url = "http://api.aladhan.com/v1/timings/" + DDMMYYYY + "?latitude=" + latitude + "&longitude=" + longitude + "&method=" + method;
+  http.begin(url);
+
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+
+    // Parse JSON response
+    StaticJsonDocument<512> doc;
+    deserializeJson(doc, payload);
+
+    // Extract the timings from the response
+    JsonObject timings = doc["data"]["timings"];
+
+    String Fajr ="";
+    String Sunrise ="";
+    String Dhuhr = "";
+    String Asr = "";
+    String Sunset = "";
+    String Maghrib = "";
+    String Isha = "";
+    String Imsak = "";
+    String Midnight = "";
+    String Firstthird = "";
+    String Lastthird = "";
+
+    // Store the timings
+    Fajr = (const char*)timings["Fajr"];
+    Sunrise = (const char*)timings["Sunrise"];
+    Dhuhr = (const char*)timings["Dhuhr"];
+    Asr = (const char*)timings["Asr"];
+    Sunset = (const char*)timings["Sunset"];
+    Maghrib = (const char*)timings["Maghrib"];
+    Isha = (const char*)timings["Isha"];
+    Imsak = (const char*)timings["Imsak"];
+    Midnight = (const char*)timings["Midnight"];
+    Firstthird = (const char*)timings["Firstthird"];
+    Lastthird = (const char*)timings["Lastthird"];
+
+    // Print the 'inter' variable to verify the stored value
+    Serial.println("Stored Fajr Timing: " + Fajr);
+    Serial.println("Stored Sunrise Timing: " + Sunrise);
+    Serial.println("Stored Dhuhr Timing: " + Dhuhr);
+    Serial.println("Stored Asr Timing: " + Asr);
+    Serial.println("Stored Sunset Timing: " + Sunset);
+    Serial.println("Stored Maghrib Timing: " + Maghrib);
+    Serial.println("Stored Isha Timing: " + Isha);
+    Serial.println("Stored Imsak Timing: " + Imsak);
+    Serial.println("Stored Midnight Timing: " + Midnight);
+    Serial.println("Stored Firstthird Timing: " + Firstthird);
+    Serial.println("Stored Lastthird Timing: " + Lastthird);
+
+
+    // Start the loop to continuously compare current time with stored timing
+    while (true) {
+      // Get the current time
+      struct tm timeinfo;
+      if (!getLocalTime(&timeinfo)) {
+        Serial.println(F("Failed to obtain time"));
+        continue;
+      }
+
+      // Format the current time as HH:MM
+      currentTime[6];
+      snprintf(currentTime, sizeof(currentTime), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+
+      Fajraction();
+      Sunriseaction();
+      Dhuhraction();
+      Asraction();
+      Sunsetaction();
+      Maghribaction();
+      Ishaaction();
+      Imsakaction();
+      Midnightaction();
+      Firstthirdaction();
+      Lastthirdaction();
+
+      delay(60000);  // Delay between comparisons (1 minute)
+    }
+  } else {
+    Serial.printf("HTTP request failed with error code: %d\n", httpCode);
+  }
+
+  http.end();
+}
+void Fajraction() {
+  // Compare the current time with the stored Fajr timing
+  if (strcmp(currentTime, Fajr.c_str()) == 0) {
+    player.copy();
+    kit.processActions();
+  } else {
+    Serial.println(F("Not Matched Fajr"));
+  }
+}
+
+void Sunriseaction() {
+  // Compare the current time with the stored Sunrise timing
+  if (strcmp(currentTime, Sunrise.c_str()) == 0) {
+    Serial.println(F("Matched Sunrise"));
+  } else {
+    Serial.println(F("Not Matched Sunrise"));
+  }
+}
+
+void Dhuhraction() {
+  // Compare the current time with the stored Dhuhr timing
+  if (strcmp(currentTime, Dhuhr.c_str()) == 0) {
+    player.copy();
+    kit.processActions();
+  } else {
+    Serial.println(F("Not Matched Dhuhr"));
+  }
+}
+
+void Asraction() {
+  // Compare the current time with the stored Asr timing
+  if (strcmp(currentTime, Asr.c_str()) == 0) {
+    player.copy();
+    kit.processActions();
+  } else {
+    Serial.println(F("Not Matched Asr"));
+  }
+}
+
+
+void Sunsetaction() {
+  // Compare the current time with the stored Sunset timing
+  if (strcmp(currentTime, Sunset.c_str()) == 0) {
+    Serial.println(F("Matched Sunset"));
+  } else {
+    Serial.println(F("Not Matched Sunset"));
+  }
+}
+
+void Maghribaction() {
+  // Compare the current time with the stored Maghrib timing
+  if (strcmp(currentTime, Maghrib.c_str()) == 0) {
+    player.copy();
+    kit.processActions();
+  } else {
+    Serial.println(F("Not Matched Maghrib"));
+  }
+}
+
+void Ishaaction() {
+  // Compare the current time with the stored Isha timing
+  if (strcmp(currentTime, Isha.c_str()) == 0) {
+    player.copy();
+    kit.processActions();
+  } else {
+    Serial.println(F("Not Matched Isha"));
+  }
+}
+
+void Imsakaction() {
+  // Compare the current time with the stored Imsak timing
+  if (strcmp(currentTime, Imsak.c_str()) == 0) {
+    Serial.println(F("Matched Imsak"));
+  } else {
+    Serial.println(F("Not Matched Imsak"));
+  }
+}
+
+void Midnightaction() {
+  // Compare the current time with the stored Midnight timing
+  if (strcmp(currentTime, Midnight.c_str()) == 0) {
+    Serial.println(F("Matched Midnight"));
+  } else {
+    Serial.println(F("Not Matched Midnight"));
+  }
+}
+
+void Firstthirdaction() {
+  // Compare the current time with the stored Firstthird timing
+  if (strcmp(currentTime, Firstthird.c_str()) == 0) {
+    Serial.println(F("Matched Firstthird"));
+  } else {
+    Serial.println(F("Not Matched Firstthird"));
+  }
+}
+
+void Lastthirdaction() {
+  // Compare the current time with the stored Lastthird timing
+  if (strcmp(currentTime, Lastthird.c_str()) == 0) {
+    Serial.println(F("Matched Lastthird"));
+  } else {
+    Serial.println(F("Not Matched Lastthird"));
+  }
+}
+
